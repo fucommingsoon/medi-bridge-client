@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* H5 移动端基础样式重置 */
+* {
+  -webkit-tap-highlight-color: transparent;
+  /* 移除移动端点击高亮 */
+}
+
+html,
+body {
+  /* 防止 iOS 橡皮筋效果 */
+  overscroll-behavior-y: none;
+}
+
+/* 禁止文本选择（H5 常见需求） */
+.no-select {
+  -webkit-user-select: none;
+  user-select: none;
+}
