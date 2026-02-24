@@ -17,7 +17,6 @@ interface TranscriptionMessage {
 interface VoiceClip {
   id: string
   blob: Blob // 音频数据
-  audioUrl: string // 音频 URL
   blobSize: number // KB
   duration: number // ms
   submitTime: Date
@@ -43,7 +42,10 @@ function App() {
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null)
   const [playingClipId, setPlayingClipId] = useState<string | null>(null)
   const [playProgress, setPlayProgress] = useState(0) // 播放进度 0-100
+  const [showVoiceClipsPanel, setShowVoiceClipsPanel] = useState(false) // 控制语音片段面板显示
+  const conversationIdRef = useRef<number | null>(null) // 使用 ref 存储会话 ID，避免闭包问题
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const currentAudioUrlRef = useRef<string | null>(null) // 当前使用的音频 URL
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const voiceClipsEndRef = useRef<HTMLDivElement>(null)
 
@@ -60,6 +62,10 @@ function App() {
         audioRef.current.pause()
         audioRef.current = null
       }
+      if (currentAudioUrlRef.current) {
+        URL.revokeObjectURL(currentAudioUrlRef.current)
+        currentAudioUrlRef.current = null
+      }
     }
   }, [])
 
@@ -73,15 +79,30 @@ function App() {
       return
     }
 
-    // 停止之前的播放
+    // 停止之前的播放并释放 URL
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
     }
+    if (currentAudioUrlRef.current) {
+      URL.revokeObjectURL(currentAudioUrlRef.current)
+      currentAudioUrlRef.current = null
+    }
+
+    // 创建音频 URL
+    const audioUrl = URL.createObjectURL(clip.blob)
+    currentAudioUrlRef.current = audioUrl
+
+    console.log('[播放] 创建音频 URL:', {
+      clipId: clip.id,
+      blobSize: clip.blob.size,
+      blobType: clip.blob.type,
+      audioUrl: audioUrl,
+    })
 
     // 创建新的音频播放器
     const audio = new Audio()
-    audio.src = clip.audioUrl
+    audio.src = audioUrl
 
     // 更新播放进度
     audio.ontimeupdate = () => {
@@ -93,15 +114,35 @@ function App() {
     audio.onended = () => {
       setPlayingClipId(null)
       setPlayProgress(0)
+      if (currentAudioUrlRef.current) {
+        URL.revokeObjectURL(currentAudioUrlRef.current)
+        currentAudioUrlRef.current = null
+      }
     }
 
     audio.onerror = (e) => {
-      console.error('[播放] 错误:', e)
+      console.error('[播放] 错误:', {
+        event: e,
+        clipId: clip.id,
+        blobSize: clip.blob.size,
+        blobType: clip.blob.type,
+        audioUrl: audioUrl,
+        audioSrc: audio.src,
+        error: audio.error?.message,
+      })
       setPlayingClipId(null)
       setPlayProgress(0)
+      if (currentAudioUrlRef.current) {
+        URL.revokeObjectURL(currentAudioUrlRef.current)
+        currentAudioUrlRef.current = null
+      }
     }
 
-    audio.play()
+    audio.play().catch((err) => {
+      console.error('[播放] play() 错误:', err)
+      setPlayingClipId(null)
+    })
+
     audioRef.current = audio
     setPlayingClipId(clip.id)
   }
@@ -117,11 +158,30 @@ function App() {
     }
   }
 
+  // 保存音频到本地
+  const handleSaveClip = (clip: VoiceClip) => {
+    // 创建下载链接
+    const url = URL.createObjectURL(clip.blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `语音片段_${new Date().getTime()}.webm`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+
+    console.log('[保存] 音频已保存:', a.download)
+  }
+
   // 停止所有播放
   const stopAllPlayback = () => {
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
+    }
+    if (currentAudioUrlRef.current) {
+      URL.revokeObjectURL(currentAudioUrlRef.current)
+      currentAudioUrlRef.current = null
     }
     setPlayingClipId(null)
   }
@@ -132,13 +192,24 @@ function App() {
   // 使用录音 hook
   const { startRecording, stopRecording, pauseRecording, resumeRecording, analyser: recorderAnalyser } = useAudioRecorder({
     onDataAvailable: async (audioBlob) => {
-      if (!conversationId) return
+      const currentConversationId = conversationIdRef.current
+      if (!currentConversationId) {
+        console.warn('[API] conversationId 为空，跳过发送')
+        return
+      }
 
       const blobSize = (audioBlob.size / 1024)
-      console.log('[API] 正在发送音频到服务器...', `${blobSize.toFixed(2)}KB`)
+      const startTime = Date.now()
+      console.log(`[API] → 立即发送音频到服务器... (${blobSize.toFixed(2)}KB), 会话ID: ${currentConversationId}`)
 
       try {
-        const result = await uploadAudio(audioBlob, conversationId)
+        const result = await uploadAudio(audioBlob, currentConversationId)
+        const elapsed = Date.now() - startTime
+
+        console.log(`[API] ✓ 服务器响应 (${elapsed}ms):`, {
+          text: result.recognized_text,
+          matches: result.total_matches,
+        })
 
         console.log('[API] ✓ 服务器响应:', {
           text: result.recognized_text,
@@ -199,11 +270,15 @@ function App() {
     onSilenceSubmit: (blob, blobSize, duration) => {
       // 前端检测到语音片段后立即添加到列表
       const clipId = `${Date.now()}-${Math.random()}`
-      const audioUrl = URL.createObjectURL(blob)
+      console.log('[UI] 收到语音片段:', {
+        clipId,
+        blobSize: blob.size,
+        blobType: blob.type,
+        duration,
+      })
       const clip: VoiceClip = {
         id: clipId,
         blob: blob,
-        audioUrl: audioUrl,
         blobSize: blobSize,
         duration: duration,
         submitTime: new Date(),
@@ -215,9 +290,9 @@ function App() {
       pendingClipIdRef.current = clipId
     },
     // 静音检测配置
-    silenceThreshold: 0.08, // 音量阈值 0-1，提高到 8% 过滤呼吸声等轻微噪音
-    silenceDuration: 1500, // 静音 1.5 秒后提交
-    minSpeechDuration: 500, // 最小语音时长 0.5 秒
+    silenceThreshold: 0.15, // 音量阈值 0-1，提高到 15% 更严格过滤噪音
+    silenceDuration: 2000, // 静音 2 秒后提交（给说话留更多缓冲）
+    minSpeechDuration: 800, // 最小语音时长 0.8 秒，过滤过短的片段
   })
 
   // 同步 analyser
@@ -230,7 +305,13 @@ function App() {
     try {
       // 创建会话
       const session = await createConsultationSession('语音问诊', 'General')
-      setConversationId(session.conversation_id)
+      const cid = session.conversation_id
+
+      // 同时更新 ref 和 state（ref 立即生效，state 用于 UI 渲染）
+      conversationIdRef.current = cid
+      setConversationId(cid)
+
+      console.log('[会话] 已创建会话，ID:', cid)
 
       // 开始录音
       const started = await startRecording()
@@ -251,16 +332,12 @@ function App() {
     setIsPaused(false)
     stopAllPlayback()
 
-    // 释放所有音频 URL
-    voiceClips.forEach(clip => {
-      URL.revokeObjectURL(clip.audioUrl)
-    })
-
     setPageState('home')
     setMessages([])
     setSymptoms([])
     setVoiceClips([])
     setConversationId(null)
+    conversationIdRef.current = null
     pendingClipIdRef.current = null
   }
 
@@ -399,7 +476,7 @@ function App() {
                   {isSpeaking ? '正在录音...' : '等待语音...'}
                 </span>
               </div>
-              <AudioWaveform analyser={analyser} isRecording={isRecording} isPaused={isPaused} silenceThreshold={0.08} />
+              <AudioWaveform analyser={analyser} isRecording={isRecording} isPaused={isPaused} silenceThreshold={0.15} />
             </section>
           )}
 
@@ -459,97 +536,142 @@ function App() {
               )}
             </div>
           </section>
-
-          {/* 语音片段记录 */}
-          <section className="bg-white rounded-2xl shadow-sm p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-semibold text-gray-900 flex items-center gap-2">
-                <span className="text-lg">🎵</span>
-                检测到的语音片段
-                <span className="text-xs text-gray-400 font-normal">({voiceClips.length})</span>
-              </h3>
-            </div>
-            <div className="space-y-2">
-              {voiceClips.length === 0 ? (
-                <div className="text-center py-6 text-gray-400 text-sm">
-                  等待语音输入...
-                </div>
-              ) : (
-                <>
-                  {voiceClips.map((clip) => (
-                    <div
-                      key={clip.id}
-                      className="bg-gray-50 rounded-xl px-4 py-3"
-                    >
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-3">
-                          <button
-                            onClick={() => handlePlayClip(clip)}
-                            className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
-                              playingClipId === clip.id
-                                ? 'bg-blue-500 text-white'
-                                : 'bg-blue-100 text-blue-600 hover:bg-blue-200'
-                            }`}
-                          >
-                            {playingClipId === clip.id ? (
-                              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                                <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
-                              </svg>
-                            ) : (
-                              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                                <path d="M8 5v14l11-7z" />
-                              </svg>
-                            )}
-                          </button>
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="text-sm font-medium text-gray-900">
-                                {(clip.duration / 1000).toFixed(1)}秒
-                              </span>
-                              <span className="text-xs text-gray-400">·</span>
-                              <span className="text-xs text-gray-500">{clip.blobSize.toFixed(2)}KB</span>
-                            </div>
-                            <p className="text-xs text-gray-400">
-                              {clip.submitTime.toLocaleTimeString('zh-CN', {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                                second: '2-digit',
-                              })}
-                            </p>
-                          </div>
-                        </div>
-                        <span className="text-xs px-2 py-1 rounded-full bg-green-100 text-green-700">
-                          {clip.transcription ? '✓ 已转录' : '⏳ 处理中'}
-                        </span>
-                      </div>
-                      {/* 播放进度条 */}
-                      {playingClipId === clip.id && (
-                        <div className="mt-2 mb-2">
-                          <div className="h-1 bg-gray-200 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-blue-500 transition-all duration-100"
-                              style={{ width: `${playProgress}%` }}
-                            ></div>
-                          </div>
-                          <p className="text-xs text-gray-400 mt-1">
-                            {playProgress.toFixed(0)}%
-                          </p>
-                        </div>
-                      )}
-                      {clip.transcription && (
-                        <div className="mt-2 pt-2 border-t border-gray-200">
-                          <p className="text-sm text-gray-700">"{clip.transcription}"</p>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                  <div ref={voiceClipsEndRef} />
-                </>
-              )}
-            </div>
-          </section>
         </div>
       </main>
+
+      {/* 浮动语音片段面板按钮 */}
+      {pageState === 'consulting' && (
+        <>
+          {/* 浮动按钮 */}
+          <button
+            onClick={() => setShowVoiceClipsPanel(!showVoiceClipsPanel)}
+            className="fixed bottom-6 right-6 z-50 bg-blue-500 hover:bg-blue-600 text-white rounded-full shadow-lg flex items-center gap-2 px-4 py-3 transition-all"
+          >
+            <span className="text-xl">🎵</span>
+            <span className="text-sm font-medium">{voiceClips.length} 片段</span>
+            {showVoiceClipsPanel ? (
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            ) : (
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+              </svg>
+            )}
+          </button>
+
+          {/* 浮动面板 */}
+          {showVoiceClipsPanel && (
+            <div className="fixed bottom-20 right-6 z-50 w-80 max-h-[60vh] bg-white rounded-2xl shadow-2xl overflow-hidden flex flex-col">
+              {/* 面板头部 */}
+              <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between bg-gray-50">
+                <h3 className="text-sm font-semibold text-gray-900 flex items-center gap-2">
+                  <span>🎵</span>
+                  检测到的语音片段
+                  <span className="text-xs text-gray-400 font-normal">({voiceClips.length})</span>
+                </h3>
+                <button
+                  onClick={() => setShowVoiceClipsPanel(false)}
+                  className="p-1 hover:bg-gray-200 rounded-lg transition-colors"
+                >
+                  <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+
+              {/* 片段列表 */}
+              <div className="flex-1 overflow-auto p-3 space-y-2">
+                {voiceClips.length === 0 ? (
+                  <div className="text-center py-8 text-gray-400 text-sm">
+                    等待语音输入...
+                  </div>
+                ) : (
+                  <>
+                    {voiceClips.map((clip) => (
+                      <div
+                        key={clip.id}
+                        className="bg-gray-50 rounded-xl px-3 py-2"
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-1">
+                              <button
+                                onClick={() => handlePlayClip(clip)}
+                                className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${
+                                  playingClipId === clip.id
+                                    ? 'bg-blue-500 text-white'
+                                    : 'bg-blue-100 text-blue-600 hover:bg-blue-200'
+                                }`}
+                                title="播放"
+                              >
+                                {playingClipId === clip.id ? (
+                                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
+                                  </svg>
+                                ) : (
+                                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M8 5v14l11-7z" />
+                                  </svg>
+                                )}
+                              </button>
+                              <button
+                                onClick={() => handleSaveClip(clip)}
+                                className="w-8 h-8 rounded-full flex items-center justify-center bg-gray-100 text-gray-600 hover:bg-gray-200 transition-colors"
+                                title="保存到本地"
+                              >
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l4-4m-4 4h4" />
+                                </svg>
+                              </button>
+                            </div>
+                            <div>
+                              <div className="flex items-center gap-1">
+                                <span className="text-xs font-medium text-gray-900">
+                                  {(clip.duration / 1000).toFixed(1)}秒
+                                </span>
+                                <span className="text-xs text-gray-400">·</span>
+                                <span className="text-xs text-gray-500">{clip.blobSize.toFixed(1)}KB</span>
+                              </div>
+                              <p className="text-xs text-gray-400">
+                                {clip.submitTime.toLocaleTimeString('zh-CN', {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit',
+                                })}
+                              </p>
+                            </div>
+                          </div>
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700">
+                            {clip.transcription ? '✓' : '⏳'}
+                          </span>
+                        </div>
+                        {/* 播放进度条 */}
+                        {playingClipId === clip.id && (
+                          <div className="mb-2">
+                            <div className="h-1 bg-gray-200 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-blue-500 transition-all duration-100"
+                                style={{ width: `${playProgress}%` }}
+                              ></div>
+                            </div>
+                          </div>
+                        )}
+                        {clip.transcription && (
+                          <div className="pt-1 border-t border-gray-200">
+                            <p className="text-xs text-gray-700 line-clamp-2">"{clip.transcription}"</p>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    <div ref={voiceClipsEndRef} />
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      )}
     </div>
   )
 }
