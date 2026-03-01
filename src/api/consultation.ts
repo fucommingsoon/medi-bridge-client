@@ -77,7 +77,7 @@ export async function uploadAudio(
   },
 ): Promise<VoiceConsultationResponse> {
   const formData = new FormData()
-  formData.append('file', audioBlob, 'audio.webm')
+  formData.append('file', audioBlob, 'audio.wav')
 
   if (conversationId) {
     formData.append('conversation_id', conversationId.toString())

@@ -21,6 +21,62 @@ interface AudioRecorderReturn {
   analyser: AnalyserNode | null
 }
 
+// WAV 编码器配置
+const SAMPLE_RATE = 16000
+const CHANNELS = 1
+const BITS_PER_SAMPLE = 16
+
+// 将 PCM Float32 数据编码为 WAV Blob
+function encodeWAV(samples: Float32Array): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(buffer)
+
+  // 写入 WAV 头
+  writeString(view, 0, 'RIFF')
+  view.setUint32(4, 36 + samples.length * 2, true)
+  writeString(view, 8, 'WAVE')
+  writeString(view, 12, 'fmt ')
+  view.setUint32(16, 16, true) // fmt chunk size
+  view.setUint16(20, 1, true) // audio format (PCM)
+  view.setUint16(22, CHANNELS, true)
+  view.setUint32(24, SAMPLE_RATE, true)
+  view.setUint32(28, SAMPLE_RATE * CHANNELS * BITS_PER_SAMPLE / 8, true) // byte rate
+  view.setUint16(32, CHANNELS * BITS_PER_SAMPLE / 8, true) // block align
+  view.setUint16(34, BITS_PER_SAMPLE, true)
+  writeString(view, 36, 'data')
+  view.setUint32(40, samples.length * 2, true)
+
+  // 写入 PCM 数据
+  floatTo16BitPCM(view, 44, samples)
+
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i))
+  }
+}
+
+function floatTo16BitPCM(view: DataView, offset: number, input: Float32Array) {
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, input[i]))
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true)
+  }
+}
+
+// 合并多个 Float32Array
+function mergeFloat32Arrays(arrays: Float32Array[]): Float32Array {
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0)
+  const result = new Float32Array(totalLength)
+  let offset = 0
+  for (const arr of arrays) {
+    result.set(arr, offset)
+    offset += arr.length
+  }
+  return result
+}
+
 export function useAudioRecorder({
   onDataAvailable,
   onError,
@@ -35,10 +91,11 @@ export function useAudioRecorder({
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const processorRef = useRef<AudioWorkletNode | ScriptProcessorNode | null>(null)
 
-  // 当前片段的 MediaRecorder 和数据块
-  const currentMediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const currentChunksRef = useRef<Blob[]>([])
+  // 当前片段的 PCM 数据
+  const currentPcmDataRef = useRef<Float32Array[]>([])
+  const isPausedRecordingRef = useRef(false)
 
   // 状态追踪
   const isRecordingRef = useRef(false)
@@ -51,8 +108,8 @@ export function useAudioRecorder({
   // 连续静音/有声计数（用于更稳定的边界检测）
   const consecutiveSilentFramesRef = useRef<number>(0)
   const consecutiveSpeechFramesRef = useRef<number>(0)
-  const MIN_SPEECH_FRAMES = 3 // 至少3帧（300ms）连续有声才算说话开始
-  const MIN_SILENCE_FRAMES = 20 // 至少20帧（2秒）连续静音才算说话结束
+  const MIN_SPEECH_FRAMES = 5 // 至少5帧（500ms）连续有声才算说话开始
+  const MIN_SILENCE_FRAMES = 5 // 改为5帧（500ms）连续静音就算说话结束
 
   // 分析音频数据判断是否为静音
   const isSilent = useCallback((analyser: AnalyserNode): boolean => {
@@ -79,61 +136,29 @@ export function useAudioRecorder({
     }
 
     return normalized < silenceThreshold
-  }, [silenceThreshold, MIN_SPEECH_FRAMES])
+  }, [silenceThreshold])
 
-  // 创建新的 MediaRecorder 用于当前片段
-  const createMediaRecorder = useCallback((stream: MediaStream): MediaRecorder => {
-    const mediaRecorder = new MediaRecorder(stream, {
-      mimeType: 'audio/webm;codecs=opus',
+  // 获取当前片段的 WAV Blob
+  const getCurrentWavBlob = useCallback((): Blob | null => {
+    const pcmData = currentPcmDataRef.current
+    if (pcmData.length === 0) return null
+
+    const merged = mergeFloat32Arrays(pcmData)
+    const blob = encodeWAV(merged)
+
+    console.log('[录音] WAV Blob 创建成功:', {
+      chunks: pcmData.length,
+      samples: merged.length,
+      size: blob.size,
+      duration: (merged.length / SAMPLE_RATE * 1000).toFixed(0) + 'ms',
     })
 
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        currentChunksRef.current.push(event.data)
-      }
-    }
-
-    return mediaRecorder
+    return blob
   }, [])
 
-  // 启动当前片段的录音
-  const startCurrentSegment = useCallback(() => {
-    if (!streamRef.current) return
-
-    currentMediaRecorderRef.current = createMediaRecorder(streamRef.current)
-    currentChunksRef.current = []
-    currentMediaRecorderRef.current.start(100)
-
-    console.log('[录音] 新片段录音已启动')
-  }, [createMediaRecorder])
-
-  // 停止并提交当前片段
-  const stopCurrentSegment = useCallback(() => {
-    const mediaRecorder = currentMediaRecorderRef.current
-    if (!mediaRecorder || mediaRecorder.state !== 'recording') {
-      return null
-    }
-
-    return new Promise<Blob | null>((resolve) => {
-      const originalOnStop = mediaRecorder.onstop
-      mediaRecorder.onstop = () => {
-        const chunks = currentChunksRef.current
-        if (chunks.length > 0) {
-          const blob = new Blob(chunks, { type: 'audio/webm;codecs=opus' })
-          console.log('[录音] 片段 Blob 创建成功:', {
-            chunks: chunks.length,
-            size: blob.size,
-          })
-          resolve(blob)
-        } else {
-          resolve(null)
-        }
-        // 恢复原始的 onstop
-        mediaRecorder.onstop = originalOnStop
-      }
-
-      mediaRecorder.stop()
-    })
+  // 清空当前片段数据
+  const clearCurrentSegment = useCallback(() => {
+    currentPcmDataRef.current = []
   }, [])
 
   // 检查静音状态并提交语音片段
@@ -155,11 +180,19 @@ export function useAudioRecorder({
       consecutiveSilentFramesRef.current = 0
     }
 
+    // 调试日志：每秒输出一次状态
+    if (import.meta.env.DEV) {
+      if (!window['__lastStateLog'] || now - window['__lastStateLog'] > 1000) {
+        console.log(`[帧计数] 有声: ${consecutiveSpeechFramesRef.current}/${MIN_SPEECH_FRAMES}, 静音: ${consecutiveSilentFramesRef.current}/${MIN_SILENCE_FRAMES}, 检测到说话: ${isSpeechDetectedRef.current}`)
+        window['__lastStateLog'] = now
+      }
+    }
+
     // 检测到说话开始：需要连续多帧都有声音
     if (!isSpeechDetectedRef.current && consecutiveSpeechFramesRef.current >= MIN_SPEECH_FRAMES) {
       isSpeechDetectedRef.current = true
       speechStartTimeRef.current = now - (consecutiveSpeechFramesRef.current * 100) // 回推开始时间
-      console.log('[录音] ▶ 检测到开始说话')
+      console.log(`[录音] ▶ 检测到开始说话 (连续 ${consecutiveSpeechFramesRef.current} 帧有声)`)
       onSpeechStart?.()
     }
 
@@ -168,39 +201,93 @@ export function useAudioRecorder({
       const speechDurationMs = now - speechStartTimeRef.current
       const silenceDurationMs = consecutiveSilentFramesRef.current * 100
 
-      console.log(`[录音] 连续静音 ${consecutiveSilentFramesRef.current} 帧 (${silenceDurationMs}ms)，说话时长 ${speechDurationMs}ms`)
+      console.log(`[录音] ◆ 检测到说话结束 (连续 ${consecutiveSilentFramesRef.current} 帧静音, ${silenceDurationMs}ms)，说话时长 ${speechDurationMs}ms，准备提交`)
 
       if (speechDurationMs >= minSpeechDuration) {
-        // 停止当前片段并获取 blob
-        stopCurrentSegment().then((blob) => {
-          if (blob) {
-            const blobSize = blob.size / 1024
-            console.log(`[录音] ✓ 提交语音片段: ${blobSize.toFixed(2)}KB, 时长: ${speechDurationMs}ms`)
+        // 获取当前片段的 WAV blob
+        const blob = getCurrentWavBlob()
+        if (blob) {
+          const blobSize = blob.size / 1024
+          console.log(`[录音] ✓ 提交语音片段: ${blobSize.toFixed(2)}KB, 时长: ${speechDurationMs}ms`)
 
-            onSpeechEnd?.(speechDurationMs)
-            onSilenceSubmit?.(blob, blobSize, speechDurationMs)
+          onSpeechEnd?.(speechDurationMs)
+          onSilenceSubmit?.(blob, blobSize, speechDurationMs)
 
-            // 立即发送到后端（异步，不阻塞）
-            console.log('[录音] → 立即发送到后端...')
-            onDataAvailable(blob)
+          // 立即发送到后端（异步，不阻塞）
+          console.log('[录音] → 立即发送到后端...')
+          onDataAvailable(blob)
 
-            // 重置状态
-            isSpeechDetectedRef.current = false
-            speechStartTimeRef.current = 0
-            consecutiveSilentFramesRef.current = 0
+          // 重置状态
+          isSpeechDetectedRef.current = false
+          speechStartTimeRef.current = 0
+          consecutiveSilentFramesRef.current = 0
 
-            // 启动新片段
-            startCurrentSegment()
-          }
-        })
+          // 清空当前片段，开始新片段
+          clearCurrentSegment()
+        }
       } else {
         console.log(`[录音] ✗ 语音片段太短 (${speechDurationMs}ms < ${minSpeechDuration}ms)，已丢弃`)
         isSpeechDetectedRef.current = false
         speechStartTimeRef.current = 0
         consecutiveSilentFramesRef.current = 0
+        clearCurrentSegment()
       }
     }
-  }, [isSilent, MIN_SPEECH_FRAMES, MIN_SILENCE_FRAMES, minSpeechDuration, startCurrentSegment, stopCurrentSegment, onDataAvailable, onSpeechStart, onSpeechEnd, onSilenceSubmit])
+  }, [isSilent, MIN_SPEECH_FRAMES, MIN_SILENCE_FRAMES, minSpeechDuration, getCurrentWavBlob, clearCurrentSegment, onDataAvailable, onSpeechStart, onSpeechEnd, onSilenceSubmit])
+
+  // 创建 AudioWorklet 处理器（内联定义）
+  const createAudioWorklet = useCallback(async (audioContext: AudioContext, source: MediaStreamAudioSourceNode) => {
+    // 创建一个简单的 AudioWorklet 处理器代码
+    const workletCode = `
+      class PCMProcessor extends AudioWorkletProcessor {
+        process(inputs, outputs, parameters) {
+          const input = inputs[0]
+          if (input.length > 0) {
+            const channelData = input[0]
+            this.port.postMessage(channelData.slice(0))
+          }
+          return true
+        }
+      }
+      registerProcessor('pcm-processor', PCMProcessor)
+    `
+
+    const blob = new Blob([workletCode], { type: 'application/javascript' })
+    const workletUrl = URL.createObjectURL(blob)
+
+    try {
+      await audioContext.audioWorklet.addModule(workletUrl)
+      const workletNode = new AudioWorkletNode(audioContext, 'pcm-processor')
+
+      workletNode.port.onmessage = (event) => {
+        if (isPausedRecordingRef.current) return
+        const pcmData = event.data as Float32Array
+        currentPcmDataRef.current.push(pcmData)
+      }
+
+      source.connect(workletNode)
+      workletNode.connect(audioContext.destination)
+
+      URL.revokeObjectURL(workletUrl)
+      return workletNode
+    } catch {
+      // 回退到 ScriptProcessorNode
+      console.warn('[录音] AudioWorklet 不可用，使用 ScriptProcessorNode')
+      const bufferSize = 4096
+      const scriptProcessor = audioContext.createScriptProcessor(bufferSize, 1, 1)
+
+      scriptProcessor.onaudioprocess = (event) => {
+        if (isPausedRecordingRef.current) return
+        const inputData = event.inputBuffer.getChannelData(0)
+        currentPcmDataRef.current.push(new Float32Array(inputData))
+      }
+
+      source.connect(scriptProcessor)
+      scriptProcessor.connect(audioContext.destination)
+
+      return scriptProcessor
+    }
+  }, [])
 
   // 开始录音
   const startRecording = useCallback(async () => {
@@ -208,8 +295,8 @@ export function useAudioRecorder({
       console.log('[录音] 正在请求麦克风权限...')
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          sampleRate: 16000,
-          channelCount: 1,
+          sampleRate: SAMPLE_RATE,
+          channelCount: CHANNELS,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
@@ -219,7 +306,7 @@ export function useAudioRecorder({
       console.log('[录音] ✓ 麦克风权限获取成功')
       streamRef.current = stream
 
-      const audioContext = new AudioContext({ sampleRate: 16000 })
+      const audioContext = new AudioContext({ sampleRate: SAMPLE_RATE })
       audioContextRef.current = audioContext
 
       const analyser = audioContext.createAnalyser()
@@ -227,39 +314,39 @@ export function useAudioRecorder({
       analyserRef.current = analyser
 
       const source = audioContext.createMediaStreamSource(stream)
-      source.connect(analyser)
       sourceRef.current = source
+      source.connect(analyser)
+
+      // 创建音频处理器
+      const processor = await createAudioWorklet(audioContext, source)
+      processorRef.current = processor
 
       isRecordingRef.current = true
+      isPausedRef.current = false
+      isPausedRecordingRef.current = false
       isSpeechDetectedRef.current = false
       speechStartTimeRef.current = 0
       silenceStartTimeRef.current = 0
       consecutiveSilentFramesRef.current = 0
       consecutiveSpeechFramesRef.current = 0
-
-      // 启动第一个片段
-      startCurrentSegment()
+      currentPcmDataRef.current = []
 
       // 启动静音检测定时器
       checkSilenceIntervalRef.current = window.setInterval(checkSilence, 100)
 
-      console.log('[录音] ✓ 录音已启动')
+      console.log('[录音] ✓ 录音已启动 (WAV 格式)')
       return true
     } catch (error) {
       console.error('[录音] ✗ 启动失败:', error)
       onError?.(error as Error)
       return false
     }
-  }, [checkSilence, startCurrentSegment, onError])
+  }, [checkSilence, createAudioWorklet, onError])
 
   const pauseRecording = useCallback(() => {
     if (isPausedRef.current) return
     isPausedRef.current = true
-
-    // 暂停当前片段
-    if (currentMediaRecorderRef.current && currentMediaRecorderRef.current.state === 'recording') {
-      currentMediaRecorderRef.current.pause()
-    }
+    isPausedRecordingRef.current = true
 
     console.log('[录音] ⏸ 录音已暂停')
   }, [])
@@ -267,11 +354,7 @@ export function useAudioRecorder({
   const resumeRecording = useCallback(() => {
     if (!isPausedRef.current) return
     isPausedRef.current = false
-
-    // 恢复当前片段
-    if (currentMediaRecorderRef.current && currentMediaRecorderRef.current.state === 'paused') {
-      currentMediaRecorderRef.current.resume()
-    }
+    isPausedRecordingRef.current = false
 
     console.log('[录音] ▶ 录音已恢复')
   }, [])
@@ -284,15 +367,16 @@ export function useAudioRecorder({
     }
 
     isPausedRef.current = false
+    isPausedRecordingRef.current = false
     isRecordingRef.current = false
 
-    // 停止当前片段并提交
+    // 提交最后一段语音
     if (isSpeechDetectedRef.current && consecutiveSpeechFramesRef.current >= MIN_SPEECH_FRAMES) {
       const now = Date.now()
       const speechDurationMs = now - speechStartTimeRef.current
 
       if (speechDurationMs >= minSpeechDuration) {
-        const blob = await stopCurrentSegment()
+        const blob = getCurrentWavBlob()
         if (blob) {
           const blobSize = blob.size / 1024
           console.log(`[录音] ✓ 提交最后一段语音: ${blobSize.toFixed(2)}KB, 时长: ${speechDurationMs}ms`)
@@ -305,15 +389,19 @@ export function useAudioRecorder({
     }
 
     // 清理
-    if (currentMediaRecorderRef.current && currentMediaRecorderRef.current.state !== 'inactive') {
-      currentMediaRecorderRef.current.stop()
+    if (processorRef.current) {
+      processorRef.current.disconnect()
+      processorRef.current = null
     }
 
     if (sourceRef.current) {
       sourceRef.current.disconnect()
+      sourceRef.current = null
     }
+
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close()
+      audioContextRef.current = null
     }
 
     if (streamRef.current) {
@@ -321,16 +409,13 @@ export function useAudioRecorder({
       streamRef.current = null
     }
 
-    currentMediaRecorderRef.current = null
-    audioContextRef.current = null
     analyserRef.current = null
-    sourceRef.current = null
-    currentChunksRef.current = []
+    currentPcmDataRef.current = []
     consecutiveSilentFramesRef.current = 0
     consecutiveSpeechFramesRef.current = 0
 
     console.log('[录音] ✓ 录音已停止')
-  }, [minSpeechDuration, stopCurrentSegment, onDataAvailable, onSpeechEnd, onSilenceSubmit, MIN_SPEECH_FRAMES])
+  }, [minSpeechDuration, getCurrentWavBlob, onDataAvailable, onSpeechEnd, onSilenceSubmit, MIN_SPEECH_FRAMES])
 
   return {
     startRecording,

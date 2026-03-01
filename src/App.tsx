@@ -164,7 +164,7 @@ function App() {
     const url = URL.createObjectURL(clip.blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `语音片段_${new Date().getTime()}.webm`
+    a.download = `语音片段_${new Date().getTime()}.wav`
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
@@ -290,7 +290,7 @@ function App() {
       pendingClipIdRef.current = clipId
     },
     // 静音检测配置
-    silenceThreshold: 0.15, // 音量阈值 0-1，提高到 15% 更严格过滤噪音
+    silenceThreshold: 0.10, // 音量阈值 0-1，降低到 10% 以便检测正常说话
     silenceDuration: 2000, // 静音 2 秒后提交（给说话留更多缓冲）
     minSpeechDuration: 800, // 最小语音时长 0.8 秒，过滤过短的片段
   })
@@ -476,7 +476,7 @@ function App() {
                   {isSpeaking ? '正在录音...' : '等待语音...'}
                 </span>
               </div>
-              <AudioWaveform analyser={analyser} isRecording={isRecording} isPaused={isPaused} silenceThreshold={0.15} />
+              <AudioWaveform analyser={analyser} isRecording={isRecording} isPaused={isPaused} silenceThreshold={0.10} />
             </section>
           )}
 
